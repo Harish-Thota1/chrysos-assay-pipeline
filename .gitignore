@@ -1,0 +1,15 @@
+# credentials
+db.env
+snow.env
+*.local.sql
+sql/snowflake/.local/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# data and output
+out/
+*.parquet
+*.whl
