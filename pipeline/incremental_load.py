@@ -1,10 +1,9 @@
 """
-Incremental load. Reads only the rows that changed since the last
-successful run and appends them to S3 as Parquet.
+Incremental load. Reads only the rows that changed since the last successful
+run and appends them to S3 as Parquet.
 
-Reads only the rows that changed since the last successful run and appends
-them to S3 as Parquet. A Python Shell job, not Spark: 180 rows does not
-need a cluster, and 0.0625 DPU costs about a thirtieth of 2 DPU.
+A Python Shell job, not Spark: 180 rows does not need a cluster, and
+0.0625 DPU costs about a thirtieth of 2 DPU.
 
                 watermark (DynamoDB)
                         |
@@ -68,6 +67,38 @@ they belong in silver at read time:
 Doing it here would be doing nothing while looking like doing something.
 
 
+THREE SAFEGUARDS, for the cases the five decisions above do not cover.
+
+A. THE READ IS BATCHED, through a server-side cursor.
+   180 rows fit in memory. A six hour backlog after an outage might not.
+   A named cursor leaves the rows on the server and hands over
+   --batch-rows at a time, and each batch is written as its own file.
+   An ordinary cursor would not help: it sends the whole result to the
+   client on execute, so the rows are already here before any fetch.
+   If batch 4 of 9 fails, batches 1 to 3 are in S3 and the watermark has
+   not moved, so the next run reads the window again and writes those
+   rows twice. Duplicates are what silver already removes. Half a window
+   with a moved watermark would be a hole.
+   The cost: the read transaction stays open while the files are written,
+   so a long backlog holds a transaction open on the source and vacuum
+   cannot clean up behind it. At a normal 180 rows that is a second. If
+   backlogs became routine, the batches would be staged to local disk
+   first and uploaded after the connection closed.
+
+B. THE WATERMARK WRITE IS CONDITIONAL on the value this run read.
+   If another run has moved it in the meantime, this write fails rather
+   than overwriting it, and the job exits saying so. This is the reason
+   the control table is DynamoDB and not a file in S3: S3 cannot do a
+   conditional write on a value, so two overlapping runs would both
+   succeed and the later one would win, silently.
+
+C. THE COLUMN LIST IS STORED AND COMPARED each run.
+   A column added in Postgres would otherwise never appear in S3 and
+   nothing would mention it. The check does not fail the run, because a
+   harmless added column should not stop ingestion. It prints the added
+   and removed names and records them in the run log.
+
+
 Job parameters:
     --pghost --pgport --pgdatabase --pguser --pgpassword
     --s3-bucket          bucket to write into
@@ -76,6 +107,7 @@ Job parameters:
     --state-table        DynamoDB control table         (default: chrysos-pipeline-state)
     --lookback-minutes   deliberate overlap             (default: 15)
     --max-window-hours   safety valve on a big backlog  (default: 6)
+    --batch-rows         rows per file, and per fetch   (default: 200,000)
     --dry-run            read and report, write nothing, do not move the watermark
 """
 
@@ -132,6 +164,7 @@ def parse_args(argv):
     p.add_argument("--state-table", dest="state_table", default=DEFAULT_STATE_TABLE)
     p.add_argument("--lookback-minutes", dest="lookback_minutes", type=int, default=15)
     p.add_argument("--max-window-hours", dest="max_window_hours", type=int, default=6)
+    p.add_argument("--batch-rows", dest="batch_rows", type=int, default=200_000)
     p.add_argument("--dry-run", dest="dry_run", action="store_true")
     p.add_argument("--JOB_NAME", dest="job_name", default="local")
     p.add_argument("--JOB_RUN_ID", dest="job_run_id", default="local")
@@ -183,19 +216,40 @@ def read_watermark(ddb, state_table, table_name):
             f"'{{\"table_name\":{{\"S\":\"{table_name}\"}},"
             f"\"watermark\":{{\"S\":\"2026-10-02T00:00:00+00:00\"}}}}'"
         )
-    return datetime.fromisoformat(item["watermark"]["S"])
+    raw = item["watermark"]["S"]
+    columns = item.get("columns", {}).get("S") or ""
+    # The raw string goes back out as the compare-and-set condition, so it is
+    # kept exactly as stored. A parsed-then-reformatted timestamp can differ
+    # by a trailing zero and the condition would never match.
+    return datetime.fromisoformat(raw), raw, columns
 
 
-def fetch_changes(conn, table, window_start, window_end):
-    """Read the rows whose updated_at falls in the window.
+def fetch_batches(conn, table, window_start, window_end, batch_rows):
+    """Stream the window out of Postgres, batch_rows at a time.
 
     The upper bound matters. Without it, the rows read would be 'everything
     up to whenever each row happened to be scanned', which is not a window
     at all and cannot be recorded as one. With it, the run can say exactly
     which interval it covered, and the watermark it saves is the interval's
     end rather than a guess.
+
+    A NAMED cursor, which means server side. An ordinary cursor sends the
+    whole result to the client on execute, so fetching in batches would do
+    nothing for memory: the rows are already here. A named cursor leaves them
+    on the server and hands over batch_rows at a time.
+
+    A named cursor needs a transaction, which is why the caller does not set
+    autocommit.
+
+    One run per batch would be wrong, so this yields batches and the caller
+    writes one file each. If batch 4 of 9 fails, batches 1 to 3 are already in
+    S3 and the watermark has not moved, so the next run reads the whole window
+    again and writes those rows a second time. Duplicates are what silver
+    already removes. Half a window and a moved watermark would be a hole.
     """
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+    with conn.cursor(name="incr_read",
+                     cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.itersize = batch_rows
         cur.execute(
             f"SELECT * FROM {table} "
             f" WHERE updated_at >  %s "
@@ -203,9 +257,12 @@ def fetch_changes(conn, table, window_start, window_end):
             f" ORDER BY updated_at, measurement_id",
             (window_start, window_end),
         )
-        rows = cur.fetchall()
-        description = cur.description
-    return rows, description
+        while True:
+            rows = cur.fetchmany(batch_rows)
+            if not rows:
+                return
+            # description is None on a named cursor until the first fetch.
+            yield rows, cur.description
 
 
 def to_arrow(rows, description, meta):
@@ -255,7 +312,8 @@ def main(argv):
     s3 = boto3.client("s3")
 
     # 1. where did we get to last time
-    watermark = read_watermark(ddb, args.state_table, short)
+    watermark, watermark_raw, prev_columns = read_watermark(
+        ddb, args.state_table, short)
 
     # 2. the new watermark, taken BEFORE the read
     read_start = datetime.now(timezone.utc)
@@ -278,64 +336,129 @@ def main(argv):
     print(f"window span      {(window_end - window_start).total_seconds() / 60:.1f} min"
           f"{'   CAPPED, a backlog is being worked through' if capped else ''}")
 
+    # 4. read and write in batches, data FIRST
+    #
+    # The file name carries the run id and a part number. window_end alone is
+    # not unique: two runs started in the same second would write to the same
+    # key and the second would overwrite the first. MaxConcurrentRuns = 1
+    # prevents that today, but that is a setting on the job, not a property of
+    # this code, and settings get changed.
+    stamp = window_end.strftime("%Y%m%dT%H%M%SZ")
+    run_tag = args.job_run_id[-8:] if args.job_run_id != "local" else "local"
+
+    meta = {
+        "_ingested_at":    read_start.isoformat(),
+        "_window_start":   window_start.isoformat(),
+        "_window_end":     window_end.isoformat(),
+        "_job_run_id":     args.job_run_id,
+    }
+
+    total_rows = 0
+    written_bytes = 0
+    parts = []
+    oldest = newest = None
+    ids = set()
+    columns_seen = ""
+
     conn = connect(args)
-    conn.set_session(readonly=True, autocommit=True)
+    conn.set_session(readonly=True)
     try:
-        rows, description = fetch_changes(conn, args.source_table,
-                                          window_start, window_end)
+        for part_no, (rows, description) in enumerate(
+                fetch_batches(conn, args.source_table, window_start,
+                              window_end, args.batch_rows)):
+            total_rows += len(rows)
+            stamps = [r["updated_at"] for r in rows]
+            oldest = min(stamps) if oldest is None else min(oldest, min(stamps))
+            newest = max(stamps) if newest is None else max(newest, max(stamps))
+            ids.update(r["measurement_id"] for r in rows)
+            if not columns_seen:
+                columns_seen = ",".join(c.name for c in description)
+
+            if args.dry_run:
+                continue
+
+            key = (f"{args.s3_prefix}/{short}/delta/"
+                   f"incr_{stamp}_{run_tag}_p{part_no:03d}.parquet")
+            arrow_table = to_arrow(rows, description, meta)
+            n = write_parquet(s3, arrow_table, args.s3_bucket, key)
+            written_bytes += n
+            parts.append(key)
+            print(f"wrote            s3://{args.s3_bucket}/{key}  ({n:,} bytes)")
     finally:
         conn.close()
 
-    print(f"rows read        {len(rows):,}")
-
-    if rows:
-        stamps = [r["updated_at"] for r in rows]
-        print(f"oldest change    {min(stamps).isoformat()}")
-        print(f"newest change    {max(stamps).isoformat()}")
-        ids = {r["measurement_id"] for r in rows}
+    print(f"rows read        {total_rows:,}")
+    if total_rows:
+        print(f"oldest change    {oldest.isoformat()}")
+        print(f"newest change    {newest.isoformat()}")
         print(f"distinct ids     {len(ids):,}   (equals rows read, "
               f"because measurement_id is the primary key)")
-
-    stamp = window_end.strftime("%Y%m%dT%H%M%SZ")
-    key = f"{args.s3_prefix}/{short}/delta/incr_{stamp}.parquet"
-
-    if args.dry_run:
-        print("\nDRY RUN. nothing written, watermark not moved.")
-        print(f"would have written  s3://{args.s3_bucket}/{key}")
-        return 0
-
-    # 4. write the data FIRST
-    written_bytes = 0
-    if rows:
-        meta = {
-            "_ingested_at":    read_start.isoformat(),
-            "_window_start":   window_start.isoformat(),
-            "_window_end":     window_end.isoformat(),
-            "_job_run_id":     args.job_run_id,
-        }
-        arrow_table = to_arrow(rows, description, meta)
-        written_bytes = write_parquet(s3, arrow_table, args.s3_bucket, key)
-        print(f"wrote            s3://{args.s3_bucket}/{key}  ({written_bytes:,} bytes)")
+        print(f"files written    {len(parts)}   "
+              f"(batch size {args.batch_rows:,})")
     else:
         # No file for an empty window. An empty Parquet file is a file
         # someone has to open to discover it is empty.
         print("wrote            nothing, no rows changed in this window")
 
-    # 5. and only now move the watermark
-    ddb.put_item(
-        TableName=args.state_table,
-        Item={
-            "table_name":    {"S": short},
-            "watermark":     {"S": window_end.isoformat()},
-            "set_by":        {"S": "incremental_load"},
-            "set_at":        {"S": datetime.now(timezone.utc).isoformat()},
-            "rows_at_set":   {"N": str(len(rows))},
-            "job_run_id":    {"S": args.job_run_id},
-        },
-    )
+    # 5. did the source change shape?
+    #
+    # A new column in Postgres would otherwise never appear in S3 and nothing
+    # would say so. This does not fail the run: a harmless added column should
+    # not stop ingestion. It makes the change loud and records it, so the drift
+    # is discovered now rather than when someone asks where the column went.
+    drift = None
+    if columns_seen and prev_columns and columns_seen != prev_columns:
+        before = set(prev_columns.split(","))
+        after = set(columns_seen.split(","))
+        drift = {"added": sorted(after - before),
+                 "removed": sorted(before - after)}
+        print(f"\nSCHEMA CHANGED since the last run")
+        print(f"  added            {drift['added'] or 'none'}")
+        print(f"  removed          {drift['removed'] or 'none'}")
+        print(f"  added columns are in this run's files. removed ones stop")
+        print(f"  appearing, and older files still carry them.\n")
+
+    if args.dry_run:
+        would_write = -(-total_rows // args.batch_rows)   # ceiling division
+        print("\nDRY RUN. nothing written, watermark not moved.")
+        print(f"would have written  {would_write} file(s) under "
+              f"s3://{args.s3_bucket}/{args.s3_prefix}/{short}/delta/")
+        return 0
+
+    # 6. and only now move the watermark, and only if nobody else moved it
+    #
+    # Compare-and-set. If another run has written a watermark since this run
+    # read it, this write fails instead of overwriting it. Picking DynamoDB
+    # over a file in S3 was for exactly this: S3 cannot do a conditional
+    # write on a value, so two overlapping runs there would both succeed and
+    # the later one would win silently.
+    try:
+        ddb.put_item(
+            TableName=args.state_table,
+            Item={
+                "table_name":    {"S": short},
+                "watermark":     {"S": window_end.isoformat()},
+                "columns":       {"S": columns_seen or prev_columns},
+                "set_by":        {"S": "incremental_load"},
+                "set_at":        {"S": datetime.now(timezone.utc).isoformat()},
+                "rows_at_set":   {"N": str(total_rows)},
+                "job_run_id":    {"S": args.job_run_id},
+            },
+            ConditionExpression="watermark = :seen",
+            ExpressionAttributeValues={":seen": {"S": watermark_raw}},
+        )
+    except ddb.exceptions.ConditionalCheckFailedException:
+        sys.exit(
+            f"\nWatermark moved while this run was working.\n"
+            f"  read       {watermark_raw}\n"
+            f"  tried      {window_end.isoformat()}\n"
+            f"Another run is active. This run's files are already in S3 and\n"
+            f"will be de-duplicated in silver. The watermark was NOT moved,\n"
+            f"so nothing has been skipped. Check MaxConcurrentRuns = 1."
+        )
     print(f"watermark out    {window_end.isoformat()}")
 
-    # 6. a run log, so the history of windows is auditable without DynamoDB
+    # 7. a run log, so the history of windows is auditable without DynamoDB
     log = {
         "table":          short,
         "job_run_id":     args.job_run_id,
@@ -346,14 +469,16 @@ def main(argv):
         "window_end":     window_end.isoformat(),
         "window_capped":  capped,
         "lookback_min":   args.lookback_minutes,
-        "rows_read":      len(rows),
+        "batch_rows":     args.batch_rows,
+        "rows_read":      total_rows,
         "bytes_written":  written_bytes,
-        "s3_key":         key if rows else None,
+        "s3_keys":        parts,
+        "schema_drift":   drift,
         "finished_at":    datetime.now(timezone.utc).isoformat(),
     }
     s3.put_object(
         Bucket=args.s3_bucket,
-        Key=f"_runlog/incremental/{short}/{stamp}.json",
+        Key=f"_runlog/incremental/{short}/{stamp}_{run_tag}.json",
         Body=json.dumps(log, indent=2).encode(),
     )
 

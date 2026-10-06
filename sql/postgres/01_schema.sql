@@ -1,5 +1,5 @@
 -- ============================================================
---  Chrysos POC  ·  stage 1  ·  source system schema
+--  Chrysos POC  ·  source system schema
 --  Target: PostgreSQL on Amazon RDS
 --
 --  This database stands in for a customer lab's operational

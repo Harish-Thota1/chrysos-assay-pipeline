@@ -24,8 +24,8 @@ STALE     rows sitting in S3 that have since been deleted in the source.
           Counted across the snapshot AND the deltas, because the snapshot
           is where most of them are. Nothing in an incremental pipeline can
           find these: no WHERE updated_at > x returns a row that is gone.
-          This is the number stage 4 exists to drive to zero, and the
-          honest number to put in a README.
+          This is the number delete handling exists to drive to zero, and
+          the honest number to put in a README.
 
 
 TWO BOUNDARY RULES, BOTH OF WHICH I GOT WRONG THE FIRST TIME
@@ -232,7 +232,7 @@ def main(argv=None):
     print(f"  HOW BAD IS THE DELETE GAP?")
     print(f"    rows in S3                  {len(in_s3):>12,}")
     print(f"    deleted in the source       {len(deleted_any):>12,}")
-    print(f"    STALE rows in S3            {len(stale):>12,}   <- stage 4")
+    print(f"    STALE rows in S3            {len(stale):>12,}   <- deletes, not handled")
     if in_s3:
         print(f"    S3 that is wrong            {100.0 * len(stale) / len(in_s3):>11.2f}%")
     print("=" * w)

@@ -1,5 +1,5 @@
 -- ============================================================
---  Chrysos POC  ·  stage 1  ·  seed the source system
+--  Chrysos POC  ·  seed the source system
 --
 --  60 machines, 100,000 measurements, 200,000 measurement rows
 --  (one row per measurement PER ELEMENT: gold and silver).
@@ -120,3 +120,13 @@ COMMIT;
 
 ANALYZE machine;
 ANALYZE assay_measurement;
+
+-- What landed. Check these before running the full load: a short seed means
+-- the snapshot will be short too, and nothing downstream will say so.
+SELECT
+  (SELECT COUNT(*) FROM machine)                            AS machines,
+  (SELECT COUNT(*) FROM assay_measurement)                  AS measurements,
+  (SELECT MIN(started_utc)::DATE FROM assay_measurement)    AS oldest_day,
+  (SELECT MAX(started_utc)::DATE FROM assay_measurement)    AS newest_day,
+  (SELECT COUNT(*) FROM assay_measurement
+   WHERE sample_type = 'crm')                               AS crm_rows;

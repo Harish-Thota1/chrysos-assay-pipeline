@@ -1,6 +1,12 @@
 # Verification
 
-Three independent checks. All output below is real, from the dates shown.
+Three checks. All the output below is real, from the dates shown.
+
+```
+1. Python, S3 vs the live database        did the pipeline lose anything?
+2. Python, S3 vs the generator's log      does an independent record agree?
+3. SQL, inside Snowflake                  do the warehouse counts add up?
+```
 
 ## 1. Did the pipeline lose anything?
 
@@ -81,7 +87,8 @@ crm_missing_cert   non_crm_has_cert
                0                  0
 ```
 
-Three of those numbers explain themselves, which is the useful property:
+Three of those numbers can be worked out in advance, which is how you know the
+pipeline is behaving rather than just finishing:
 
 **107,320 / 52,536 = 2.04.** A 15 minute look-back on a 15 minute schedule puts
 every row in two consecutive windows, so it arrives roughly twice. Predicted

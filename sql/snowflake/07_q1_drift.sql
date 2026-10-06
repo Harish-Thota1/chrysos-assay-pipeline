@@ -1,7 +1,10 @@
 -- 07_q1_drift.sql
 -- Which machines are drifting out of calibration, and how early can we tell?
 --
--- Read only. Runs against core.fact_assay_run and raw.machine_reading.
+-- Read only. Runs against core.fact_assay_run and raw.machine_reading, which
+-- hold a year of assay history and 15-second telemetry. Those two tables are
+-- not created by this repo, so this file fails against an empty warehouse.
+-- Files 01 to 06 do not depend on it.
 --
 -- The two tables are at different grains, 37M measurements against 125M
 -- sensor readings every 15 seconds, so each is collapsed to one row per
